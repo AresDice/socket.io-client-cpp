@@ -67,10 +67,10 @@ namespace sio
         return m_need_ack;
     }
     
-    void event::put_ack_message(message::ptr const& ack_message)
+    void event::put_ack_message(message::list const& ack_message)
     {
         if(m_need_ack)
-            m_ack_message = ack_message;
+            m_ack_message = std::move(ack_message);
     }
     
     inline
@@ -91,13 +91,13 @@ namespace sio
     {
     }
     
-    message::ptr const& event::get_ack_message() const
+    message::list const& event::get_ack_message() const
     {
         return m_ack_message;
     }
     
     inline
-    message::ptr& event::get_ack_message_impl()
+    message::list& event::get_ack_message_impl()
     {
         return m_ack_message;
     }
@@ -131,7 +131,7 @@ namespace sio
         
         void close();
         
-        void emit(std::string const& name, message::list const& msglist, std::function<void (message::ptr const&)> const& ack);
+        void emit(std::string const& name, message::list const& msglist, std::function<void (message::list const&)> const& ack);
         
         std::string const& get_namespace() const {return m_nsp;}
         
@@ -150,12 +150,12 @@ namespace sio
         
         // Message Parsing callbacks.
         void on_socketio_event(const std::string& nsp, int msgId,const std::string& name, message::list&& message);
-        void on_socketio_ack(int msgId, message::ptr const& message);
+        void on_socketio_ack(int msgId, message::list const& message);
         void on_socketio_error(message::ptr const& err_message);
         
         event_listener get_bind_listener_locked(string const& event);
         
-        void ack(int msgId,string const& name,message::ptr const& ack_message);
+        void ack(int msgId,string const& name,message::list const& ack_message);
         
         void timeout_connection(const boost::system::error_code &ec);
         
@@ -172,7 +172,7 @@ namespace sio
         bool m_connected;
         std::string m_nsp;
         
-        std::map<unsigned int, std::function<void (message::ptr const&)> > m_acks;
+        std::map<unsigned int, std::function<void (message::list const&)> > m_acks;
         
         std::map<std::string, event_listener> m_event_binding;
         
@@ -183,6 +183,8 @@ namespace sio
         std::queue<packet> m_packet_queue;
         
         std::mutex m_event_mutex;
+
+		std::mutex m_packet_mutex;
         
         friend class socket;
     };
@@ -226,8 +228,8 @@ namespace sio
     
     socket::impl::impl(client_impl *client,std::string const& nsp):
         m_client(client),
-        m_nsp(nsp),
-        m_connected(false)
+        m_connected(false),
+        m_nsp(nsp)
     {
         NULL_GUARD(client);
         if(m_client->opened())
@@ -243,7 +245,7 @@ namespace sio
     
     unsigned int socket::impl::s_global_event_id = 1;
     
-    void socket::impl::emit(std::string const& name, message::list const& msglist, std::function<void (message::ptr const&)> const& ack)
+    void socket::impl::emit(std::string const& name, message::list const& msglist, std::function<void (message::list const&)> const& ack)
     {
         NULL_GUARD(m_client);
         message::ptr msg_ptr = msglist.to_array_message(name);
@@ -265,6 +267,10 @@ namespace sio
     void socket::impl::send_connect()
     {
         NULL_GUARD(m_client);
+        if(m_nsp == "/")
+        {
+            return;
+        }
         packet p(packet::type_connect,m_nsp);
         m_client->send(p);
         m_connection_timer.reset(new boost::asio::deadline_timer(m_client->get_io_service()));
@@ -302,9 +308,18 @@ namespace sio
         {
             m_connected = true;
             m_client->on_socket_opened(m_nsp);
-            while (!m_packet_queue.empty()) {
-                m_client->send(m_packet_queue.front());
+
+            while (true) {
+				m_packet_mutex.lock();
+				if(m_packet_queue.empty())
+				{
+					m_packet_mutex.unlock();
+					return;
+				}
+				sio::packet front_pack = std::move(m_packet_queue.front());
                 m_packet_queue.pop();
+				m_packet_mutex.unlock();
+				m_client->send(front_pack);
             }
         }
     }
@@ -312,18 +327,23 @@ namespace sio
     void socket::impl::on_close()
     {
         NULL_GUARD(m_client);
+        sio::client_impl *client = m_client;
+        m_client = NULL;
+
         if(m_connection_timer)
         {
             m_connection_timer->cancel();
             m_connection_timer.reset();
         }
         m_connected = false;
-        while (!m_packet_queue.empty()) {
-            m_packet_queue.pop();
-        }
-        m_client->on_socket_closed(m_nsp);
-        m_client->remove_socket(m_nsp);
-        m_client = NULL;
+		{
+			std::lock_guard<std::mutex> guard(m_packet_mutex);
+			while (!m_packet_queue.empty()) {
+				m_packet_queue.pop();
+			}
+		}
+        client->on_socket_closed(m_nsp);
+        client->remove_socket(m_nsp);
     }
     
     void socket::impl::on_open()
@@ -337,6 +357,7 @@ namespace sio
         if(m_connected)
         {
             m_connected = false;
+			std::lock_guard<std::mutex> guard(m_packet_mutex);
             while (!m_packet_queue.empty()) {
                 m_packet_queue.pop();
             }
@@ -394,19 +415,13 @@ namespace sio
                 const message::ptr ptr = p.get_message();
                 if(ptr->get_flag() == message::flag_array)
                 {
-                    const array_message* array_ptr = static_cast<const array_message*>(ptr.get());
-                    if(array_ptr->get_vector().size() >= 1&&array_ptr->get_vector()[0]->get_flag() == message::flag_string)
-                    {
-                        message::ptr value_ptr;
-                        if(array_ptr->get_vector().size()>1)
-                        {
-                            value_ptr = array_ptr->get_vector()[1];
-                        }
-                        this->on_socketio_ack(p.get_pack_id(), value_ptr);
-                        break;
-                    }
+					message::list msglist(ptr->get_vector());
+					this->on_socketio_ack(p.get_pack_id(),msglist);
                 }
-                this->on_socketio_ack(p.get_pack_id(),ptr);
+				else
+				{
+					this->on_socketio_ack(p.get_pack_id(),message::list(ptr));
+				}
                 break;
             }
                 // Error
@@ -434,16 +449,15 @@ namespace sio
         }
     }
     
-    void socket::impl::ack(int msgId, const string &name, const message::ptr &ack_message)
+    void socket::impl::ack(int msgId, const string &, const message::list &ack_message)
     {
-        message::list li(ack_message);
-        packet p(m_nsp, li.to_array_message(name),msgId,true);
+        packet p(m_nsp, ack_message.to_array_message(),msgId,true);
         send_packet(p);
     }
     
-    void socket::impl::on_socketio_ack(int msgId, message::ptr const& message)
+    void socket::impl::on_socketio_ack(int msgId, message::list const& message)
     {
-        std::function<void (message::ptr const&)> l;
+        std::function<void (message::list const&)> l;
         {
             std::lock_guard<std::mutex> guard(m_event_mutex);
             auto it = m_acks.find(msgId);
@@ -469,8 +483,9 @@ namespace sio
             return;
         }
         m_connection_timer.reset();
-        LOG("Connection timeout"<<std::endl);
-        this->on_disconnect();
+        LOG("Connection timeout,close socket."<<std::endl);
+        //Should close socket if no connected message arrive.Otherwise we'll never ask for open again.
+        this->on_close();
     }
     
     void socket::impl::send_packet(sio::packet &p)
@@ -478,14 +493,23 @@ namespace sio
         NULL_GUARD(m_client);
         if(m_connected)
         {
-            while (!m_packet_queue.empty()) {
-                m_client->send(m_packet_queue.front());
+            while (true) {
+				m_packet_mutex.lock();
+				if(m_packet_queue.empty())
+				{
+					m_packet_mutex.unlock();
+					break;
+				}
+				sio::packet front_pack = std::move(m_packet_queue.front());
                 m_packet_queue.pop();
+				m_packet_mutex.unlock();
+				m_client->send(front_pack);
             }
             m_client->send(p);
         }
         else
         {
+			std::lock_guard<std::mutex> guard(m_packet_mutex);
             m_packet_queue.push(p);
         }
     }
@@ -546,7 +570,7 @@ namespace sio
         m_impl->off_error();
     }
 
-    void socket::emit(std::string const& name, message::list const& msglist, std::function<void (message::ptr const&)> const& ack)
+    void socket::emit(std::string const& name, message::list const& msglist, std::function<void (message::list const&)> const& ack)
     {
         m_impl->emit(name, msglist,ack);
     }

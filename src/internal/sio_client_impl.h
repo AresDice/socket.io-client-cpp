@@ -14,12 +14,22 @@
 #endif
 #include <websocketpp/client.hpp>
 #if _DEBUG || DEBUG
+#if SIO_TLS
+#include <websocketpp/config/debug_asio.hpp>
+typedef websocketpp::config::debug_asio_tls client_config;
+#else
 #include <websocketpp/config/debug_asio_no_tls.hpp>
 typedef websocketpp::config::debug_asio client_config;
+#endif //SIO_TLS
+#else
+#if SIO_TLS
+#include <websocketpp/config/asio_client.hpp>
+typedef websocketpp::config::asio_tls_client client_config;
 #else
 #include <websocketpp/config/asio_no_tls_client.hpp>
 typedef websocketpp::config::asio_client client_config;
-#endif
+#endif //SIO_TLS
+#endif //DEBUG
 #include <boost/asio/deadline_timer.hpp>
 
 #include <memory>
@@ -87,7 +97,8 @@ namespace sio
         }
         
         // Client Functions - such as send, etc.
-        void connect(const std::string& uri, const std::map<string, string>& queryString);
+        void connect(const std::string& uri, const std::map<std::string, std::string>& queryString,
+                     const std::map<std::string, std::string>& httpExtraHeaders);
         
         sio::socket::ptr const& socket(const std::string& nsp);
         
@@ -159,6 +170,15 @@ namespace sio
 
         void clear_timers();
         
+        #if SIO_TLS
+        typedef websocketpp::lib::shared_ptr<boost::asio::ssl::context> context_ptr;
+        
+        context_ptr on_tls_init(connection_hdl con);
+        #endif
+        
+        // Percent encode query string
+        std::string encode_query_string(const std::string &query);
+
         // Connection pointer for client functions.
         connection_hdl m_con;
         client_type m_client;
@@ -166,6 +186,7 @@ namespace sio
         std::string m_sid;
         std::string m_base_url;
         std::string m_query_string;
+        std::map<std::string, std::string> m_http_headers;
 
         unsigned int m_ping_interval;
         unsigned int m_ping_timeout;

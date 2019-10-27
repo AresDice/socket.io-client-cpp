@@ -9,6 +9,7 @@
 #include <rapidjson/encodedstream.h>
 #include <rapidjson/writer.h>
 #include <cassert>
+#include <boost/lexical_cast.hpp>
 
 #define kBIN_PLACE_HOLDER "_placeholder"
 
@@ -17,6 +18,16 @@ namespace sio
     using namespace rapidjson;
     using namespace std;
     void accept_message(message const& msg,Value& val, Document& doc,vector<shared_ptr<const string> >& buffers);
+
+	void accept_bool_message(bool_message const& msg, Value& val)
+	{
+		val.SetBool(msg.get_bool());
+	}
+
+	void accept_null_message(Value& val)
+	{
+		val.SetNull();
+	}
 
     void accept_int_message(int_message const& msg, Value& val)
     {
@@ -94,6 +105,16 @@ namespace sio
             accept_string_message(*(static_cast<const string_message*>(msg_ptr)), val);
             break;
         }
+		case message::flag_boolean:
+		{
+			accept_bool_message(*(static_cast<const bool_message*>(msg_ptr)), val);
+			break;
+		}
+		case message::flag_null:
+		{
+			accept_null_message(val);
+			break;
+		}
         case message::flag_binary:
         {
             accept_binary_message(*(static_cast<const binary_message*>(msg_ptr)), val,doc,buffers);
@@ -162,6 +183,14 @@ namespace sio
             }
             return ptr;
         }
+		else if(value.IsBool())
+		{
+			return bool_message::create(value.GetBool());
+		}
+		else if(value.IsNull())
+		{
+			return null_message::create();
+		}
         return message::ptr();
     }
 
@@ -169,8 +198,8 @@ namespace sio
         _frame(frame_message),
         _type((isAck?type_ack : type_event) | type_undetermined),
         _nsp(nsp),
-        _message(msg),
         _pack_id(pack_id),
+        _message(msg),
         _pending_buffers(0)
     {
         assert((!isAck
@@ -181,8 +210,8 @@ namespace sio
         _frame(frame_message),
         _type(type),
         _nsp(nsp),
-        _message(msg),
         _pack_id(-1),
+        _message(msg),
         _pending_buffers(0)
     {
 
@@ -259,7 +288,7 @@ namespace sio
             pos++;
             if (_type == type_binary_event || _type == type_binary_ack) {
                 size_t score_pos = payload_ptr.find('-');
-                _pending_buffers = stoi(payload_ptr.substr(pos,score_pos));
+                _pending_buffers = boost::lexical_cast<unsigned>(payload_ptr.substr(pos,score_pos - pos));
                 pos = score_pos+1;
             }
         }
@@ -299,11 +328,11 @@ namespace sio
 
         if(pos<json_pos)//we've got pack id.
         {
-            _pack_id = stoi(payload_ptr.substr(pos,json_pos - pos));
+            _pack_id = boost::lexical_cast<int>(payload_ptr.substr(pos,json_pos - pos));
         }
         if (_frame == frame_message && (_type == type_binary_event || _type == type_binary_ack)) {
             //parse later when all buffers are arrived.
-            _buffers.push_back(make_shared<const string>(payload_ptr.data() + json_pos, payload_ptr.length() - json_pos));
+            _buffers.push_back(make_shared<string>(payload_ptr.data() + json_pos, payload_ptr.length() - json_pos));
             return true;
         }
         else
